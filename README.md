@@ -1,17 +1,24 @@
 # Omarchy on the 2017 MacBook Pro 15" (A1707 / MacBookPro14,3) — Repair Runbook
 
 **Omarchy/Arch on the 15" 2017 Touch Bar MacBook Pro (MacBookPro14,3, T1 chip).**
-Two repairs that aren't documented anywhere in a reproducible form:
 
 | Problem | Root cause | Fix lives in |
 |---|---|---|
-| Wi-Fi never creates an interface (`brcmfmac` crashes, no `wlan0`, ever) | Current `linux-firmware` `brcmfmac43602` blobs **never POST the rev-02 BCM43602**; the 2015-era blob boots it and then *requires* an NVRAM board file with the machine's real MAC | [`scripts/fix-wifi-43602.sh`](scripts/fix-wifi-43602.sh) |
-| Touch Bar dark on *some boots*, "worked yesterday, dead today", zero error messages | Upstream overlay **hardcodes HID instance numbers** (`.0001/.0002`) that are actually registration *order* and shift boot to boot | [`scripts/fix-touchbar-instances.sh`](scripts/fix-touchbar-instances.sh) |
+| Wi-Fi never creates an interface (`brcmfmac` crashes, no `wlan0`, ever) | **Two independent causes on this machine:** a non-stock/corrupt `brcmfmac43602` blob in the field (chip never POSTs), plus a missing NVRAM board file with the machine's *real* MAC (`cur_etheraddr failed, -5`) | [`scripts/fix-wifi-43602.sh`](scripts/fix-wifi-43602.sh) |
+| Touch Bar dark on *some boots*, "worked yesterday, dead today", zero error messages | Overlay **hardcodes HID instance numbers** (`.0001/.0002`) that are actually registration *order* and shift boot to boot — also independently found upstream in [PR #26](https://github.com/gavinmclelland/omarchy-macbookpro14-3/pull/26) (farkas), which covers 1 of the 3 hardcoded locations; this fix covers all three | [`scripts/fix-touchbar-instances.sh`](scripts/fix-touchbar-instances.sh) |
 
 Verified 2026-09-26 on kernel `7.2.5-3-omarchy` through cold-reboot persistence tests
 (symptoms reproduced identically on `linux-lts` 6.18 — not a kernel regression).
 
-**Status:** upstream issue opened: [gavinmclelland/omarchy-macbookpro14-3#31](https://github.com/gavinmclelland/omarchy-macbookpro14-3/issues/31)
+> **Correction notice (2026-09-26):** an earlier version of this runbook claimed the
+> 2015-vintage firmware blob was required and newer blobs "can't POST the rev-02 chip."
+> That was wrong — a compressed-container hash was mistaken for a content hash. Every
+> official `linux-firmware-broadcom` package from 2023 through 2026 ships the **identical**
+> blob (`bf4cfc23…` uncompressed; Broadcom hasn't touched it since 2015). What this machine
+> actually had was a **non-stock/corrupt blob** (`7f735b72…`) — which proves field corruption
+> happens, and makes "verify against `bf4cfc23…` first" the correct triage step. Thanks to
+> the independent review that caught this and to farkas for PR #26. See issue
+> [#31](https://github.com/gavinmclelland/omarchy-macbookpro14-3/issues/31) for the full record.
 
 ---
 
@@ -40,16 +47,19 @@ journalctl -b -u touchbar.service --no-pager | tail -3        # "Finished Enable
 
 **Symptoms.** No wireless interface ever appears. dmesg shows `brcmf_pcie_download_fw_nvram: FW failed to initialize`, or — after trying older firmware — `Timeout on response for query command` / `brcmf_c_preinit_dcmds: Retrieving cur_etheraddr failed, -5`.
 
-**What it is NOT** (all eliminated with evidence during a two-week debug — don't retest):
-corrupt firmware packages, missing NVRAM alone, rfkill/airplane, PCIe power state (D0), driver reload, `brcmfmac_wcc` (no WCC ACPI device exists on T1 Macs), `feature_disable` quirks, ASPM L1, kernel regression (LTS kernels fail identically), PRAM/EC resets, dead hardware (**the card works perfectly in macOS** — which is the tell that this is firmware-vintage, not hardware).
+**What it is NOT** (all eliminated with evidence during the debug — don't retest):
+rfkill/airplane, PCIe power state (D0), driver reload, `brcmfmac_wcc` (no WCC ACPI device exists on T1 Macs), `feature_disable` quirks, ASPM L1, kernel regression (LTS kernels fail identically), PRAM/EC resets, dead hardware (**the card works perfectly in macOS** — the tell that this is firmware/board-file, not hardware), and — for the record — *firmware vintage*: there is only one official 43602 blob content, so "old blob vs new blob" can never be the axis (see correction notice).
 
-**Root cause.** The `brcmfmac43602-pcie.bin` shipping in linux-firmware (tested through the 2023→2026 vintages) never lets the **rev 02** BCM43602 (`14e4:43ba` rev 02) complete POST. The 2015-era blob — firmware ID `7.35.177.61 (r598657)`, still in the Arch archive package `linux-firmware-20231110.74158e7a-1` (`.zst` sha256 `ee04af3b5be1399613b2e592a7e340a8dff2d9f98cce87a3c3a0fdfdedee562e`) — boots the chip. The old blob then **requires** an NVRAM board file (new blobs tolerated its absence by crashing earlier anyway), and the board file must carry the machine's **real MAC** (from macOS; Apple OUI `dc:a9:04`) — guides' placeholder MACs will bite you.
+**Root cause (two independent causes; both were live on this machine).**
 
-The script does: fetch + sha-verify the 2015 blob → back up the current one → install blob + NVRAM under **both** the generic and the DMI-specific (`…Apple Inc.-MacBookPro14,3.txt`) names → ensure `feature_disable=0x82000` (separate Apple WPA-handshake quirk) → pin `IgnorePkg = linux-firmware` in pacman.conf so the next system update can't silently re-break everything.
+1. **Field-corrupted firmware blob.** The machine's installed `brcmfmac43602-pcie.bin` hashed (uncompressed) `7f735b72…` — content no official package ever shipped. A corrupt blob never completes chip POST. Official content is `bf4cfc23ee952a3d82ef33a0f5f87853201c98f1bed034876a910f354f37862d` in *every* `linux-firmware-broadcom` build 2023→2026 (all stamp the firmware ID `7.35.177.61 (r598657)`, dated 2015 — Broadcom hasn't touched this blob in a decade). **Triage rule: `zstd -dc /usr/lib/firmware/brcm/brcmfmac43602-pcie.bin.zst | sha256sum` and compare against `bf4cfc23…` before believing anything else.** (Caution: hash the *decompressed* content — `.zst` container hashes differ per compression run and prove nothing. This exact mistake produced an incorrect root cause in an earlier revision of this runbook.)
+2. **NVRAM board file with a real MAC.** The chip requires a board file (`brcmfmac43602-pcie.txt`) carrying the machine's actual Wi-Fi MAC. The overlay's shipped template contains the placeholder `xx:xx:xx:xx:xx:xx`, and a placeholder/absent MAC produces `brcmf_c_preinit_dcmds: Retrieving cur_etheraddr failed, -5` + `Timeout on response for query command`. The kernel firmware loader searches `/usr/lib/firmware/updates/` first and requests the **board-specific filename** (`brcmfmac43602-pcie.Apple Inc.-MacBookPro14,3.txt`) before the generic one — so that DMI-named file with the real MAC is what actually gets loaded. Get the MAC from macOS: System Information → Network → Wi-Fi (OUI varies by unit — this machine's is `dc:a9:04`, others e.g. `8c:85:90`; never trust a guide's example MAC).
+
+The script does: verify the blob against official content (reinstall via `pacman -S linux-firmware-broadcom --overwrite` if non-stock, backing the corrupt one up) → fetch the NVRAM template, patch the real MAC, install under both names in `updates/` **and** `brcm/` → ensure `feature_disable=0x82000` (separate Apple WPA-handshake quirk). No pacman pin: the blob content hasn't changed 2023→2026, and the blob is owned by `linux-firmware-broadcom` anyway, not the `linux-firmware` meta-package.
 
 **Benign log noise with the old blob (ignore):** `no clm_blob available (err=-2)`, `fail to get arp ip table err:-52`.
 
-**Fallback if `-5` timeout persists:** the alternate NVRAM variant (`boardflags3=0x00000300`, from [nohzafk/omarchy-macbookpro-t1](https://github.com/nohzafk/omarchy-macbookpro-t1)) — one-line change to the script. We didn't need it; the variant this repo uses worked.
+**Fallback if `-5` timeout persists with a real MAC:** try the alternate NVRAM variant (`boardflags3=0x00000300`, from [nohzafk/omarchy-macbookpro-t1](https://github.com/nohzafk/omarchy-macbookpro-t1)) — one-line change to the script. We didn't need it; the variant this repo uses worked.
 
 ## Touch Bar: the long version
 
@@ -70,9 +80,9 @@ The script does: fetch + sha-verify the 2015 blob → back up the current one �
 
 ## Maintenance gotchas
 
-- **Re-running the overlay's `install.sh` reverts BOTH fixes.** Re-apply `fix-wifi-43602.sh` + `fix-touchbar-instances.sh` after every overlay reinstall. (Ordinary kernel updates are fine — DKMS rebuilds the drivers automatically.)
-- **`IgnorePkg = linux-firmware`** must survive in `/etc/pacman.conf`, or the next full update replaces the working blob.
-- **macOS dual-boot is safe** — separate partitions, macOS never touches the Linux-side fixes. But macOS updates / the "Startup Disk" pane can re-bless the macOS ESP as default boot (refix from Linux with `efibootmgr`), a PRAM reset wipes EFI boot entries entirely, and clock skew between OSes is fixed with `timedatectl set-local-rtc 1`.
+- **Re-running the overlay's `install.sh` reverts the Touch Bar fix** (it redeploys the hardcoded-ID scripts; your `touchbar.service.d/` drop-in survives). It does **not** touch the firmware blob, modprobe config, or your board-specific NVRAM filename — the Wi-Fi fix is safe. Re-apply `fix-touchbar-instances.sh` after every overlay reinstall. (Ordinary kernel updates are fine — DKMS rebuilds the drivers automatically.)
+- **No pacman pin is needed.** The blob content is stable 2023→2026, and it belongs to `linux-firmware-broadcom`, not `linux-firmware` — an `IgnorePkg = linux-firmware` line protects nothing. If you ever truly must override a packaged firmware file, `/usr/lib/firmware/updates/` is unowned by any package and searched first.
+- **macOS dual-boot is safe** — separate partitions, macOS never touches the Linux-side fixes. But macOS updates / the "Startup Disk" pane can re-bless the macOS ESP as default boot (refix from Linux with `efibootmgr`), and a PRAM reset wipes EFI boot entries entirely. Clock handling: macOS keeps the hardware clock in UTC, so leave Linux at the default (`timedatectl set-local-rtc 0`); only set `1` if you dual-boot a Windows install.
 - `macbook12-spi-driver-dkms` fails to build on every kernel (ancient upstream; mainline `applespi` covers the keyboard). Safe to remove; it's pure update noise.
 
 ## Repo layout
@@ -112,10 +122,11 @@ Skip the overlay for Wi-Fi freely — it adds nothing there. Keep it for Touch B
 
 ## Credits / sources
 
+- [farkas / PR #26](https://github.com/gavinmclelland/omarchy-macbookpro14-3/pull/26) (Sep 12, 2026) — independently discovered the Touch Bar HID-renumbering root cause and fixed `touchbar-enable.sh` with a by-driver discovery approach. Our fix covers the two locations #26 does not (the `touchbar.service` condition and `touchbar-fn-watch.sh`); the ideal merge is noted in [issue #31](https://github.com/gavinmclelland/omarchy-macbookpro14-3/issues/31).
 - [gavinmclelland/omarchy-macbookpro14-3](https://github.com/gavinmclelland/omarchy-macbookpro14-3) — the platform overlay; our work patches *its* scripts. Issue: [#31](https://github.com/gavinmclelland/omarchy-macbookpro14-3/issues/31)
 - [nohzafk/omarchy-macbookpro-t1](https://github.com/nohzafk/omarchy-macbookpro-t1) — base guide + alternate NVRAM variant
 - Arch Linux package archive — the firmware blob bisect source of truth
-- Debug methodology: two weeks of evidence-bisect over a paste-relay connection to a remote dual-boot machine — one variable per experiment, verdicts only on fresh boots. That discipline is why this runbook contains no folklore.
+- Debug methodology: two weeks of evidence-bisect over a paste-relay connection to a remote dual-boot machine — one variable per experiment, verdicts only on fresh boots. Plus an independent review after publication that caught our one wrong root cause — which is now corrected above, in public, with the lesson (hash content, not containers) folded into the triage steps.
 
 ## Disclaimer
 
